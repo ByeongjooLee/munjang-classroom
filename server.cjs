@@ -7,13 +7,14 @@ CREATE TABLE IF NOT EXISTS members(id TEXT PRIMARY KEY,room TEXT,name TEXT,secre
 CREATE INDEX IF NOT EXISTS members_name ON members(room,name);
 CREATE TABLE IF NOT EXISTS docs(id TEXT,kind TEXT,data TEXT,rev INTEGER,PRIMARY KEY(id,kind));`);
 db.exec(`CREATE TABLE IF NOT EXISTS shares(id TEXT PRIMARY KEY,enabled INTEGER);CREATE TABLE IF NOT EXISTS peerfeedback(author TEXT,target TEXT,quote TEXT,text TEXT);CREATE TABLE IF NOT EXISTS quizzes(id TEXT PRIMARY KEY,room TEXT,prompt TEXT);CREATE TABLE IF NOT EXISTS answers(quiz TEXT,student TEXT,text TEXT,mask TEXT,PRIMARY KEY(quiz,student));`);
+db.exec("CREATE TABLE IF NOT EXISTS papers(id TEXT PRIMARY KEY,owner TEXT,title TEXT); CREATE VIEW IF NOT EXISTS manuscripts AS SELECT id,id AS owner,room,name || ' · 첫 원고' AS name FROM members UNION ALL SELECT p.id,m.id,m.room,m.name || ' · ' || p.title FROM papers p JOIN members m ON p.owner=m.id;");
 const sessions=new Map(), attempts=new Map(), files={'/':'index.html','/editor':'editor.html'};
 function fail(status,message){throw Object.assign(Error(message),{status})}
 function hash(value,salt=crypto.randomBytes(16).toString('hex')){return salt+':'+crypto.scryptSync(value,salt,32).toString('hex')}
 function matches(value,stored){return crypto.timingSafeEqual(Buffer.from(hash(value,stored.split(':')[0])),Buffer.from(stored))}
 function field(value,max=80){if(typeof value!=='string'||!value.trim()||value.length>max)fail(400,'입력값을 확인하세요.');return value.trim()}
-function state(s){const members=s.admin?db.prepare('SELECT id,name FROM members WHERE room=? ORDER BY name,id').all(s.room):db.prepare('SELECT id,name FROM members WHERE id=?').all(s.id);
-const docs=db.prepare('SELECT d.* FROM docs d JOIN members m ON m.id=d.id WHERE m.room=? AND (? OR m.id=?)').all(s.room,+s.admin,s.id||'');return {...s,expires:undefined,members,docs:docs.map(d=>({...d,data:JSON.parse(d.data)}))}}
+function state(s){const members=s.admin?db.prepare('SELECT id,name,owner FROM manuscripts WHERE room=? ORDER BY name,id').all(s.room):db.prepare('SELECT id,name,owner FROM manuscripts WHERE owner=?').all(s.id);
+const docs=db.prepare('SELECT d.* FROM docs d JOIN manuscripts m ON m.id=d.id WHERE m.room=? AND (? OR m.owner=?)').all(s.room,+s.admin,s.id||'');return {...s,expires:undefined,members,docs:docs.map(d=>({...d,data:JSON.parse(d.data)}))}}
 const server=http.createServer(async(req,res)=>{function send(n,obj){res.writeHead(n,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(obj))}
 try{const url=req.url.split('?')[0];if(req.method==='GET'&&Object.hasOwn(files,url)){res.setHeader('Content-Type','text/html; charset=utf-8');res.end(fs.readFileSync(path.join(__dirname,files[url])));return}
 const token=(req.headers.authorization||'').replace(/^Bearer /,''),session=sessions.get(token);
@@ -27,20 +28,21 @@ else{const entry=field(x.room).normalize('NFC');let r=db.prepare('SELECT * FROM 
 const key=crypto.randomBytes(32).toString('hex');sessions.set(key,{id,room,title,admin,expires:t+12*3600000});return send(200,{token:key})}
 if(!session||session.expires<Date.now())fail(401,'다시 입장하세요.');
 if(url==='/api/logout'){sessions.delete(token);return send(200,{})}
-const room=session.room,uid=session.id;
-if(url==='/api/activities'){const peers=db.prepare('SELECT m.id,m.name FROM members m JOIN shares s ON s.id=m.id WHERE m.room=? AND s.enabled=1 AND m.id<>?').all(room,uid);
-const comments=db.prepare('SELECT f.quote,f.text,m.name FROM peerfeedback f JOIN members m ON m.id=f.author WHERE f.target=? ORDER BY f.rowid').all(uid);
+const room=session.room,uid=session.id;const paper=x.paper||uid;if(!session.admin && x.paper && !db.prepare('SELECT 1 FROM manuscripts WHERE id=? AND owner=?').get(paper,uid))fail(403,'내 원고를 선택하세요.');
+if(url==='/api/paper'&&!session.admin){const title=field(x.title),id=crypto.randomUUID();db.prepare('INSERT INTO papers VALUES(?,?,?)').run(id,uid,title);return send(200,{id})}
+if(url==='/api/activities'){const peers=db.prepare('SELECT m.id,m.name FROM manuscripts m JOIN shares s ON s.id=m.id WHERE m.room=? AND s.enabled=1 AND m.owner<>?').all(room,uid);
+const comments=db.prepare('SELECT f.quote,f.text,m.name FROM peerfeedback f JOIN members m ON m.id=f.author WHERE f.target=? ORDER BY f.rowid').all(paper);
 const quizzes=db.prepare('SELECT id,prompt FROM quizzes WHERE room=? ORDER BY rowid').all(room);
 const answers=session.admin?db.prepare('SELECT a.*,m.name FROM answers a JOIN quizzes q ON a.quiz=q.id JOIN members m ON a.student=m.id WHERE q.room=?').all(room):db.prepare('SELECT * FROM answers WHERE student=?').all(uid);
-return send(200,{shared:!!db.prepare('SELECT enabled FROM shares WHERE id=?').get(uid)?.enabled,peers,comments,quizzes,answers})}
-if(url==='/api/share'&&!session.admin){db.prepare('INSERT OR REPLACE INTO shares VALUES(?,?)').run(uid,+!!x.enabled);return send(200,{})}
-if(url==='/api/peer'||url==='/api/peerfeedback'){const target=db.prepare('SELECT m.name FROM members m JOIN shares s ON s.id=m.id WHERE m.room=? AND m.id=? AND s.enabled=1 AND m.id<>?').get(room,x.target,uid);if(!target||session.admin)fail(403,'공유된 동료 원고를 선택하세요.');
+return send(200,{shared:!!db.prepare('SELECT enabled FROM shares WHERE id=?').get(paper)?.enabled,peers,comments,quizzes,answers})}
+if(url==='/api/share'&&!session.admin){db.prepare('INSERT OR REPLACE INTO shares VALUES(?,?)').run(paper,+!!x.enabled);return send(200,{})}
+if(url==='/api/peer'||url==='/api/peerfeedback'){const target=db.prepare('SELECT m.name FROM manuscripts m JOIN shares s ON s.id=m.id WHERE m.room=? AND m.id=? AND s.enabled=1 AND m.owner<>?').get(room,x.target,uid);if(!target||session.admin)fail(403,'공유된 동료 원고를 선택하세요.');
 if(url==='/api/peer'){let text='';for(const e of JSON.parse(db.prepare("SELECT data FROM docs WHERE id=? AND kind='edits'").get(x.target)?.data||'[]'))text=text.slice(0,e.at)+e.add+text.slice(e.at+e.del);return send(200,{text,name:target.name})}
 db.prepare('INSERT INTO peerfeedback VALUES(?,?,?,?)').run(uid,x.target,String(x.quote||'').slice(0,500),field(x.text,3000));return send(200,{})}
 if(url==='/api/quiz'&&session.admin){db.prepare('INSERT INTO quizzes VALUES(?,?,?)').run(crypto.randomUUID(),room,field(x.prompt,4000));return send(200,{})}
 if(url==='/api/answer'&&!session.admin){if(!db.prepare('SELECT id FROM quizzes WHERE id=? AND room=?').get(x.quiz,room))fail(403,'이 강의실의 문제가 아닙니다.');if(typeof x.text!=='string'||x.text.length>20000||typeof x.mask!=='string'||x.mask.length!==x.text.length||/[^01]/.test(x.mask))fail(400,'답안을 확인하세요.');db.prepare('INSERT OR REPLACE INTO answers VALUES(?,?,?,?)').run(x.quiz,uid,x.text,x.mask);return send(200,{})}
-if(url!=='/api/write')fail(404,'없는 요청입니다.');const m=db.prepare('SELECT room FROM members WHERE id=?').get(x.id);
-if(!m||m.room!==session.room||(session.admin?!['comments','correction'].includes(x.kind):x.id!==session.id||!['edits','layout'].includes(x.kind)))fail(403,'저장 권한이 없습니다.');
+if(url!=='/api/write')fail(404,'없는 요청입니다.');const m=db.prepare('SELECT room,owner FROM manuscripts WHERE id=?').get(x.id);
+if(!m||m.room!==session.room||(session.admin?!['comments','correction'].includes(x.kind):m.owner!==session.id||!['edits','layout'].includes(x.kind)))fail(403,'저장 권한이 없습니다.');
 if(!Array.isArray(x.data))fail(400,'잘못된 원고입니다.');let rev=db.prepare('SELECT rev FROM docs WHERE id=? AND kind=?').get(x.id,x.kind)?.rev||0;if(rev!==x.rev)fail(409,'다른 창에서 먼저 수정했습니다. 이 창의 글을 복사한 뒤 다시 입장하세요.');db.prepare('INSERT OR REPLACE INTO docs VALUES(?,?,?,?)').run(x.id,x.kind,JSON.stringify(x.data),++rev);send(200,{rev})
 }catch(e){send(e.status||400,{error:e.status?e.message:'요청을 처리할 수 없습니다.'})}});
 server.listen(Number(process.env.PORT||3817),process.env.HOST||'127.0.0.1',()=>console.log('문장실 http://'+server.address().address+':'+server.address().port));
